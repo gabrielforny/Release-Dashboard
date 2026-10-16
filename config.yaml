@@ -1,0 +1,33 @@
+# ZCRM Release Automation — configuração
+
+# Repositório local do frontend (pode ser sobrescrito com --repo)
+repo_path: "/home/gabriel.muniz/Documentos/zcrm_front"
+
+# Docker Hub
+docker_registry: "zanthusinovacao1/zcrm_front"
+
+# Slack (opcional — defina SLACK_TOKEN no ambiente)
+slack:
+  channel: "#team-frontend"
+  message_limit: 200
+
+# Jira (opcional — defina JIRA_TOKEN e JIRA_EMAIL no ambiente)
+jira:
+  base_url: "https://zanthus.atlassian.net"
+  # Template de JQL usado pelo botão "Importar do Jira" na Esteira do Time.
+  # {version} é substituído pelo crm_version salvo em dashboard_config.json
+  # (ex: "57" -> fixVersion = "Neosense 57").
+  # "Categorias" na tela do Jira corresponde ao campo padrão "labels".
+  jql_template: 'labels = "neos-frontend" AND fixVersion = "Neosense {version}" ORDER BY updated DESC'
+
+# Timeouts (segundos)
+timeouts:
+  ng_build: 900
+  docker_build: 600
+  docker_push: 300
+
+# Arquivo de relatório
+report_path: "release-report.md"
+
+# Changelog
+changelog_path: "CHANGELOG.md"

@@ -1,0 +1,25 @@
+# Ambiente Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Credenciais e dados sensíveis
+.env
+
+# Dados de estado local (não pertencem ao repo)
+formalizacoes.json
+dashboard_config.json
+dashboard_tasks.json
+
+# Relatórios gerados
+*-report.md
+
+# Arquivos temporários do debug
+debug_*.py
+formalizar_*.py
+
+# Cache
+*.egg-info/
+dist/
+build/
