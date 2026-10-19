@@ -561,8 +561,11 @@ def api_hotfix_run():
                 cmd += ["--current-release", data["current_release"]]
         if data.get("docker_registry"):
             cmd += ["--docker-registry", data["docker_registry"]]
+        from_step = int(data.get("from_step", 1))
+        if from_step > 1:
+            cmd += ["--resume-from-step", str(from_step)]
 
-        threading.Thread(target=_stream_process, args=(cmd, BASE_DIR, "hotfix"), daemon=True).start()
+        threading.Thread(target=_stream_process, args=(cmd, BASE_DIR, "hotfix", from_step), daemon=True).start()
         return jsonify({"ok": True})
 
 @app.route("/api/hotfix/retry-step", methods=["POST"])
@@ -2137,6 +2140,24 @@ details.fz-preview[open] summary::before{content:'▾ ';}
             <label class="form-label">Branch da release ATUAL (recebe a propagação do fix)</label>
             <input class="form-control" id="hz-current-release" placeholder="release/v2.31.0_zcrm_api_2.31.0_RC">
           </div>
+        </div>
+      </div>
+
+      <div style="display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap;margin-bottom:16px;">
+        <div class="form-row" style="margin:0;min-width:260px;flex:1;">
+          <label class="form-label">Iniciar a partir da etapa</label>
+          <select class="form-control" id="hz-from-step">
+            <option value="1">01 — Do início (completo)</option>
+            <option value="2">02 — Checkout da release alvo</option>
+            <option value="3">03 — Merge da branch de hotfix</option>
+            <option value="4">04 — Atualizar CHANGELOG</option>
+            <option value="5">05 — Atualizar package.json</option>
+            <option value="6">06 — ng build --prod</option>
+            <option value="7">07 — Criar tag do hotfix</option>
+            <option value="8">08 — Propagar para release atual</option>
+            <option value="9">09 — Docker build + push</option>
+            <option value="10">10 — Relatório final</option>
+          </select>
         </div>
       </div>
 
@@ -3715,6 +3736,8 @@ async function startHotfix() {
     return;
   }
 
+  const fromStep = parseInt(document.getElementById('hz-from-step').value) || 1;
+
   const payload = {
     hotfix_branch: branch,
     target_release: target,
@@ -3723,12 +3746,18 @@ async function startHotfix() {
     description: document.getElementById('hz-description').value.trim(),
     is_previous_release: isPrevious,
     current_release: currentRel,
+    from_step: fromStep,
   };
+
+  const stepLabel = fromStep > 1
+    ? `\nIniciando a partir da etapa ${String(fromStep).padStart(2,'0')}`
+    : '';
 
   const ok = await showConfirm(
     `Iniciar pipeline de hotfix para ${version}?\n\n` +
     `Branch: ${branch}\nRelease alvo: ${target}` +
     (isPrevious ? `\nSerá propagado para: ${currentRel}` : '') +
+    stepLabel +
     `\n\nCertifique-se de que a VPN está conectada antes de confirmar.`,
     {icon:'🚀', title:'Iniciar hotfix', okLabel:'Iniciar'}
   );
