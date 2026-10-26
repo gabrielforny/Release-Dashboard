@@ -35,6 +35,7 @@ TASKS_FILE  = BASE_DIR / "dashboard_tasks.json"
 REPORT_FILE   = BASE_DIR / "release-report.md"
 RELEASE_SH    = BASE_DIR / "release.sh"
 FORMALIZ_FILE = BASE_DIR / "formalizacoes.json"
+HISTORY_FILE  = BASE_DIR / "release_history.json"
 
 _process       = None
 _process_lock  = threading.Lock()
@@ -124,6 +125,18 @@ def _save_formalizacoes(items: list) -> None:
     store = _load_fz_store()
     store["items"] = items
     _save_fz_store(store)
+
+
+def _load_history() -> list:
+    if HISTORY_FILE.exists():
+        try: return json.loads(HISTORY_FILE.read_text())
+        except Exception: pass
+    return []
+
+def _save_history_entry(entry: dict) -> None:
+    entries = _load_history()
+    entries.insert(0, entry)
+    HISTORY_FILE.write_text(json.dumps(entries[:200], indent=2, ensure_ascii=False))
 
 
 # ── rotas API ─────────────────────────────────────────────────────────────────
@@ -222,6 +235,12 @@ def _stream_process(cmd: list[str], cwd: Path, pipeline: str, resume_from_step: 
         current_step_failed   = False  # True when STEP_FAIL|N was received
         error_buf             = []
 
+        import time as _time
+        _run_start  = _time.time()
+        _steps_ok   = 0
+        _steps_fail = 0
+        _steps_skip = 0
+
         for raw_line in proc.stdout:
             line  = raw_line.rstrip("\n")
             clean = _ansi.sub("", line).strip()
@@ -233,6 +252,7 @@ def _stream_process(cmd: list[str], cwd: Path, pipeline: str, resume_from_step: 
                 try:
                     fail_num = int(clean.split("|")[1])
                     current_step_failed = True
+                    _steps_fail += 1
                     err_detail = " · ".join(error_buf[-5:]) if error_buf else "Verifique o log da etapa"
                     _broadcast({"t": "step_done", "step": fail_num,
                                 "status": "failed", "error": err_detail})
@@ -254,6 +274,7 @@ def _stream_process(cmd: list[str], cwd: Path, pipeline: str, resume_from_step: 
             if clean.startswith("STEP_SKIPPED|"):
                 try:
                     skip_num = int(clean.split("|")[1])
+                    _steps_skip += 1
                     _broadcast({"t": "step_done", "step": skip_num, "status": "skipped"})
                 except (ValueError, IndexError):
                     pass
@@ -269,6 +290,7 @@ def _stream_process(cmd: list[str], cwd: Path, pipeline: str, resume_from_step: 
                 # Only send step_done for the previous step if it wasn't
                 # already sent via STEP_FAIL (to avoid double-marking).
                 if current_step > 0 and not current_step_failed:
+                    _steps_ok += 1
                     _broadcast({"t": "step_done", "step": current_step, "status": "success"})
                 current_step        = int(m.group(1))
                 current_step_failed = False
@@ -291,13 +313,62 @@ def _stream_process(cmd: list[str], cwd: Path, pipeline: str, resume_from_step: 
         # Final step_done only if the step wasn't already marked via STEP_FAIL
         if current_step > 0 and not current_step_failed:
             if proc.returncode != 0:
+                _steps_fail += 1
                 err_detail = " · ".join(error_buf[-5:]) if error_buf else "Verifique o log da etapa"
                 _broadcast({"t": "step_done", "step": current_step,
                             "status": "failed", "error": err_detail})
             else:
+                _steps_ok += 1
                 _broadcast({"t": "step_done", "step": current_step, "status": "success"})
 
         _broadcast({"t": "done", "code": proc.returncode})
+
+        # Record this run in pipeline history
+        import datetime as _dt, uuid as _uuid
+        _run_end  = _time.time()
+        _duration = int(_run_end - _run_start)
+        _outcome  = "success" if proc.returncode == 0 else "failed"
+        _cfg = _load_config()
+        _hist_entry = {
+            "id":           _uuid.uuid4().hex[:8],
+            "pipeline":     pipeline,
+            "started_at":   _dt.datetime.fromtimestamp(_run_start).isoformat(timespec="seconds"),
+            "finished_at":  _dt.datetime.fromtimestamp(_run_end).isoformat(timespec="seconds"),
+            "duration_s":   _duration,
+            "outcome":      _outcome,
+            "steps_ok":     _steps_ok,
+            "steps_fail":   _steps_fail,
+            "steps_skip":   _steps_skip,
+            "steps_total":  _steps_ok + _steps_fail + _steps_skip,
+            "version":      _cfg.get("next_version") or _cfg.get("version", ""),
+            "release_branch": _cfg.get("next_release") or _cfg.get("current_release", ""),
+            "from_step":    resume_from_step,
+        }
+        try:
+            _save_history_entry(_hist_entry)
+        except Exception:
+            pass
+
+        # Optional Slack notification on pipeline end (set SLACK_PIPELINE_CHANNEL in .env)
+        _notif_channel = os.getenv("SLACK_PIPELINE_CHANNEL", "")
+        if _notif_channel:
+            try:
+                import datetime as _dt2
+                from modules.slack_ops import post_plain_message as _slk_post
+                _emoji  = "✅" if _outcome == "success" else "❌"
+                _pl_lbl = "Release" if pipeline == "release" else "Hotfix"
+                _dur_m  = _duration // 60
+                _dur_s  = _duration % 60
+                _dur_str = f"{_dur_m}m {_dur_s}s" if _dur_m else f"{_dur_s}s"
+                _msg = (
+                    f"{_emoji} *{_pl_lbl} pipeline {_outcome}*\n"
+                    f"Versão: `{_hist_entry['version'] or '—'}`\n"
+                    f"Duração: {_dur_str} · "
+                    f"Etapas: {_steps_ok}✓ {_steps_fail}✗ {_steps_skip}⊘"
+                )
+                _slk_post(_msg, channel=_notif_channel)
+            except Exception:
+                pass
 
     except Exception as exc:
         _broadcast({"t": "error", "v": str(exc)})
@@ -627,6 +698,10 @@ def api_hotfix_report():
     if hotfix_report.exists():
         return hotfix_report.read_text(encoding="utf-8"), 200, {"Content-Type": "text/plain"}
     return "", 404
+
+@app.route("/api/history")
+def api_history():
+    return jsonify(_load_history())
 
 @app.route("/api/git/branches")
 def api_git_branches():
@@ -1883,6 +1958,40 @@ details.fz-preview[open] summary::before{content:'▾ ';}
 .fz-preview-msg{margin-top:6px;background:var(--term-bg);color:var(--term-fg);border-radius:6px;padding:8px 10px;font-family:monospace;font-size:11px;line-height:1.6;white-space:pre-wrap;word-break:break-all;}
 .fz-preview-sep{text-align:center;font-size:10px;color:var(--text3);margin:4px 0;}
 .fz-preview-reply{background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-family:monospace;font-size:11px;color:var(--text2);white-space:pre-wrap;}
+
+/* ── history page ── */
+#page-historico .page-content{max-width:none;}
+.hist-empty{text-align:center;padding:48px 0;color:var(--text3);font-size:13px;}
+.hist-table{width:100%;border-collapse:collapse;font-size:13px;}
+.hist-table th{text-align:left;padding:8px 12px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--text3);border-bottom:2px solid var(--border);background:var(--surface2);}
+.hist-table td{padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:middle;}
+.hist-table tr:last-child td{border-bottom:none;}
+.hist-table tr:hover td{background:var(--surface2);}
+.hist-outcome{display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:700;padding:3px 9px;border-radius:99px;}
+.hist-outcome.success{background:rgba(22,163,74,.12);color:var(--success);}
+.hist-outcome.failed{background:rgba(220,38,38,.12);color:var(--danger);}
+.hist-pipeline{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;padding:2px 8px;border-radius:99px;}
+.hist-pl-release{background:rgba(37,99,235,.12);color:var(--info);}
+.hist-pl-hotfix{background:rgba(220,38,38,.12);color:var(--danger);}
+.hist-note{font-size:10px;color:var(--text3);font-style:italic;}
+
+/* ── DORA metrics ── */
+.dora-row{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:24px;}
+@media(max-width:900px){.dora-row{grid-template-columns:repeat(2,1fr);}}
+.dora-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px 20px;box-shadow:var(--shadow);position:relative;overflow:hidden;}
+.dora-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;}
+.dora-card.dc-df::before{background:var(--success);}
+.dora-card.dc-lt::before{background:var(--info);}
+.dora-card.dc-cfr::before{background:var(--warn);}
+.dora-card.dc-mttr::before{background:var(--purple);}
+.dora-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--text3);margin-bottom:6px;}
+.dora-val{font-size:30px;font-weight:800;color:var(--text);line-height:1;margin-bottom:3px;font-variant-numeric:tabular-nums;}
+.dora-unit{font-size:11px;color:var(--text3);margin-bottom:10px;}
+.dora-badge{display:inline-flex;align-items:center;font-size:10px;font-weight:700;padding:2px 8px;border-radius:99px;letter-spacing:.04em;}
+.dora-badge.elite{background:rgba(22,163,74,.14);color:var(--success);}
+.dora-badge.high{background:rgba(37,99,235,.12);color:var(--info);}
+.dora-badge.medium{background:rgba(217,119,6,.12);color:var(--warn);}
+.dora-badge.low{background:rgba(220,38,38,.12);color:var(--danger);}
 </style>
 </head>
 <body>
@@ -1940,6 +2049,9 @@ details.fz-preview[open] summary::before{content:'▾ ';}
     </li>
     <li class="sb-item" onclick="goto('formalizar', this)">
       <span class="sb-icon">↗</span> Formalizar
+    </li>
+    <li class="sb-item" onclick="goto('historico', this)">
+      <span class="sb-icon">◷</span> Histórico
     </li>
   </ul>
 
@@ -2038,6 +2150,17 @@ details.fz-preview[open] summary::before{content:'▾ ';}
         </div>
         <div class="card-body">
           <div id="ov-kpi-snap" style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;"></div>
+        </div>
+      </div>
+
+      <!-- pipeline activity -->
+      <div class="card" style="margin-top:16px;">
+        <div class="card-header">
+          <span class="card-header-title">Atividade recente — Pipelines</span>
+          <button class="card-header-action" onclick="gotoByName('historico')">Ver histórico →</button>
+        </div>
+        <div id="ov-pipeline-activity" style="padding:0 4px 4px;">
+          <div style="padding:14px 12px;font-size:13px;color:var(--text3)">Nenhuma execução registrada.</div>
         </div>
       </div>
 
@@ -2407,6 +2530,53 @@ details.fz-preview[open] summary::before{content:'▾ ';}
       <div class="fz-section-hdr">Atividades para formalizar</div>
       <div id="fz-list"></div>
 
+    </div>
+  </div>
+
+  <!-- ── HISTÓRICO ──────────────────────────────────────────────────────── -->
+  <div id="page-historico" class="page">
+    <div class="page-content">
+      <div class="fz-page-header">
+        <div>
+          <h2 class="fz-page-title">Histórico de Pipelines</h2>
+          <p style="font-size:13px;color:var(--text3);margin-top:3px">Todas as execuções de release e hotfix com métricas DORA.</p>
+        </div>
+      </div>
+
+      <div class="dora-row">
+        <div class="dora-card dc-df">
+          <div class="dora-label">Deploy Frequency</div>
+          <div class="dora-val" id="dora-df">—</div>
+          <div class="dora-unit">deploys / semana (30d)</div>
+          <div class="dora-badge" id="dora-df-badge"></div>
+        </div>
+        <div class="dora-card dc-lt">
+          <div class="dora-label">Lead Time</div>
+          <div class="dora-val" id="dora-lt">—</div>
+          <div class="dora-unit">minutos — média release</div>
+          <div class="dora-badge" id="dora-lt-badge"></div>
+        </div>
+        <div class="dora-card dc-cfr">
+          <div class="dora-label">Change Failure Rate</div>
+          <div class="dora-val" id="dora-cfr">—</div>
+          <div class="dora-unit">% das execuções com falha</div>
+          <div class="dora-badge" id="dora-cfr-badge"></div>
+        </div>
+        <div class="dora-card dc-mttr">
+          <div class="dora-label">MTTR</div>
+          <div class="dora-val" id="dora-mttr">—</div>
+          <div class="dora-unit">minutos — média hotfix</div>
+          <div class="dora-badge" id="dora-mttr-badge"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <span class="card-header-title">Execuções recentes</span>
+          <button class="card-header-action" onclick="loadHistory()">↻ Atualizar</button>
+        </div>
+        <div id="hist-list"><div class="hist-empty">Carregando…</div></div>
+      </div>
     </div>
   </div>
 
@@ -2887,7 +3057,7 @@ applyTheme();
 const PAGE_TITLES = {
   overview:'Visão Geral', pipeline:'Pipeline', hotfix:'Hotfix',
   esteira:'Esteira do Time', time:'Time', kpis:'KPIs do Time',
-  formalizar:'Formalizar no Slack',
+  formalizar:'Formalizar no Slack', historico:'Histórico de Pipelines',
 };
 
 function goto(id, el) {
@@ -2897,11 +3067,12 @@ function goto(id, el) {
   if (el) el.classList.add('active');
   document.getElementById('topbar-title').textContent = PAGE_TITLES[id] || id;
   if (id === 'formalizar') renderFormalizar();
+  if (id === 'historico')  loadHistory();
 }
 
 function gotoByName(id) {
   const items = document.querySelectorAll('.sb-item');
-  const names = ['overview','pipeline','hotfix','esteira','time','kpis','formalizar'];
+  const names = ['overview','pipeline','hotfix','esteira','time','kpis','formalizar','historico'];
   const i = names.indexOf(id);
   goto(id, i >= 0 ? items[i] : null);
 }
@@ -2914,6 +3085,7 @@ async function init() {
   await loadConfig();
   await loadTasks();
   await loadReport();
+  loadHistory();   // non-blocking: populates overview widget + history page
 
   renderAll();
   renderHotfixChecklist();
@@ -2941,6 +3113,136 @@ async function loadConfig() {
 async function loadTasks() {
   const r = await fetch('/api/tasks');
   tasks = await r.json();
+}
+
+// ── history & DORA ────────────────────────────────────────────────────────────
+let _history = [];
+
+async function loadHistory() {
+  try {
+    const r = await fetch('/api/history');
+    _history = await r.json();
+  } catch(e) { _history = []; }
+  renderHistory();
+}
+
+function _fmtDur(s) {
+  if (!s && s !== 0) return '—';
+  const m = Math.floor(s / 60), sec = s % 60;
+  return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+}
+
+function _doraLevel(metric, value) {
+  if (metric === 'df')   return value >= 7 ? {l:'elite',n:'Elite'} : value >= 1 ? {l:'high',n:'Alto'} : value >= 0.25 ? {l:'medium',n:'Médio'} : {l:'low',n:'Baixo'};
+  if (metric === 'lt')   return value <= 60 ? {l:'elite',n:'Elite'} : value <= 180 ? {l:'high',n:'Alto'} : value <= 720 ? {l:'medium',n:'Médio'} : {l:'low',n:'Baixo'};
+  if (metric === 'cfr')  return value <= 5 ? {l:'elite',n:'Elite'} : value <= 10 ? {l:'high',n:'Alto'} : value <= 30 ? {l:'medium',n:'Médio'} : {l:'low',n:'Baixo'};
+  if (metric === 'mttr') return value <= 60 ? {l:'elite',n:'Elite'} : value <= 240 ? {l:'high',n:'Alto'} : value <= 1440 ? {l:'medium',n:'Médio'} : {l:'low',n:'Baixo'};
+  return {l:'medium',n:'—'};
+}
+
+function _setBadge(id, metric, value) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (!value && value !== 0) { el.textContent = ''; el.className = 'dora-badge'; return; }
+  const d = _doraLevel(metric, value);
+  el.textContent = d.n;
+  el.className = 'dora-badge ' + d.l;
+}
+
+function renderHistory() {
+  const histEl = document.getElementById('hist-list');
+  const thirtyAgo = Date.now() - 30 * 24 * 3600 * 1000;
+  const recent = _history.filter(e => new Date(e.started_at).getTime() >= thirtyAgo);
+
+  if (!_history.length) {
+    histEl.innerHTML = '<div class="hist-empty">Nenhuma execução registrada ainda.<br>Execute um pipeline para começar a registrar o histórico.</div>';
+    ['dora-df','dora-lt','dora-cfr','dora-mttr'].forEach(id => { const el=document.getElementById(id); if(el) el.textContent='—'; });
+    ['dora-df-badge','dora-lt-badge','dora-cfr-badge','dora-mttr-badge'].forEach(id => { const el=document.getElementById(id); if(el){ el.textContent=''; el.className='dora-badge'; } });
+    return;
+  }
+
+  // Deployment Frequency: successful deploys per week over last 30d
+  const succRecent = recent.filter(e => e.outcome === 'success').length;
+  const df = parseFloat((succRecent / 4.3).toFixed(1));
+  const dfEl = document.getElementById('dora-df');
+  if (dfEl) dfEl.textContent = df.toFixed(1);
+  _setBadge('dora-df-badge', 'df', df);
+
+  // Lead Time: avg duration of successful release pipelines in minutes
+  const succRel = recent.filter(e => e.outcome === 'success' && e.pipeline === 'release');
+  const lt = succRel.length ? Math.round(succRel.reduce((s,e) => s+(e.duration_s||0), 0) / succRel.length / 60) : null;
+  const ltEl = document.getElementById('dora-lt');
+  if (ltEl) ltEl.textContent = lt ?? '—';
+  _setBadge('dora-lt-badge', 'lt', lt);
+
+  // Change Failure Rate
+  const cfr = recent.length ? Math.round(recent.filter(e => e.outcome === 'failed').length / recent.length * 100) : 0;
+  const cfrEl = document.getElementById('dora-cfr');
+  if (cfrEl) cfrEl.textContent = cfr + '%';
+  _setBadge('dora-cfr-badge', 'cfr', cfr);
+
+  // MTTR: avg duration of successful hotfixes in minutes
+  const hf = recent.filter(e => e.pipeline === 'hotfix' && e.outcome === 'success');
+  const mttr = hf.length ? Math.round(hf.reduce((s,e) => s+(e.duration_s||0), 0) / hf.length / 60) : null;
+  const mttrEl = document.getElementById('dora-mttr');
+  if (mttrEl) mttrEl.textContent = mttr ?? '—';
+  _setBadge('dora-mttr-badge', 'mttr', mttr);
+
+  // Render table
+  const esc = s => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
+  const rows = _history.map(e => {
+    const date = new Date(e.started_at).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});
+    const pl   = e.pipeline || 'release';
+    const plCl = pl === 'hotfix' ? 'hist-pl-hotfix' : 'hist-pl-release';
+    const oc   = e.outcome || 'success';
+    const stepsOk   = e.steps_ok   ?? 0;
+    const stepsFail = e.steps_fail ?? 0;
+    const stepsSkip = e.steps_skip ?? 0;
+    const stepsStr  = e.steps_total ? `<span style="color:var(--success)">${stepsOk}✓</span> <span style="color:var(--danger)">${stepsFail}✗</span> <span style="color:var(--text3)">${stepsSkip}⊘</span>` : '—';
+    const note = e.from_step > 1 ? `<span class="hist-note">retomado da etapa ${e.from_step}</span>` : '';
+    return `<tr>
+      <td style="font-variant-numeric:tabular-nums">${esc(date)}</td>
+      <td><span class="hist-pipeline ${plCl}">${pl}</span></td>
+      <td style="font-family:monospace;font-size:11px;color:var(--text2)">${esc(e.version||'—')}</td>
+      <td><span class="hist-outcome ${oc}">${oc==='success'?'✓ Sucesso':'✗ Falhou'}</span></td>
+      <td style="font-variant-numeric:tabular-nums">${_fmtDur(e.duration_s)}</td>
+      <td>${stepsStr}</td>
+      <td>${note}</td>
+    </tr>`;
+  }).join('');
+
+  histEl.innerHTML = `<table class="hist-table">
+    <thead><tr>
+      <th>Data / Hora</th><th>Pipeline</th><th>Versão</th>
+      <th>Resultado</th><th>Duração</th><th>Etapas</th><th></th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+
+  // Update overview mini-widget
+  const ovEl = document.getElementById('ov-pipeline-activity');
+  if (ovEl) {
+    if (!_history.length) {
+      ovEl.innerHTML = '<div style="padding:14px 12px;font-size:13px;color:var(--text3)">Nenhuma execução registrada.</div>';
+    } else {
+      const last5 = _history.slice(0, 5);
+      const esc = s => (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
+      ovEl.innerHTML = last5.map(e => {
+        const date = new Date(e.started_at).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+        const pl   = e.pipeline || 'release';
+        const plCl = pl === 'hotfix' ? 'hist-pl-hotfix' : 'hist-pl-release';
+        const oc   = e.outcome || 'success';
+        const ocIcon = oc === 'success' ? '<span style="color:var(--success)">✓</span>' : '<span style="color:var(--danger)">✗</span>';
+        return `<div style="display:flex;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid var(--border);">
+          ${ocIcon}
+          <span class="hist-pipeline ${plCl}" style="flex-shrink:0">${pl}</span>
+          <span style="flex:1;font-size:12px;font-family:monospace;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(e.version||'—')}</span>
+          <span style="font-size:11px;color:var(--text3);flex-shrink:0">${esc(date)}</span>
+          <span style="font-size:11px;color:var(--text3);flex-shrink:0;font-variant-numeric:tabular-nums">${_fmtDur(e.duration_s)}</span>
+        </div>`;
+      }).join('');
+    }
+  }
 }
 
 async function syncJira() {

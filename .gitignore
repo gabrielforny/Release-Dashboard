@@ -11,6 +11,7 @@ __pycache__/
 formalizacoes.json
 dashboard_config.json
 dashboard_tasks.json
+release_history.json
 
 # Relatórios gerados
 *-report.md
