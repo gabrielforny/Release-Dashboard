@@ -71,6 +71,7 @@ def _default_config() -> dict:
         "docker_registry": "zanthusinovacao1/zcrm_front",
         "current_sprint":  "Sprint 55",
         "team_name":       "Front-end ZCRM",
+        "slack_user_id":   "",
     }
 
 
@@ -265,6 +266,18 @@ def _stream_process(cmd: list[str], cwd: Path, pipeline: str, resume_from_step: 
                     fail_num = int(clean.split("|")[1])
                     err_detail = " · ".join(error_buf[-5:]) if error_buf else "Verifique o log da etapa"
                     _broadcast({"t": "step_fail_pause", "step": fail_num, "error": err_detail})
+                    _dm_uid = _load_config().get("slack_user_id") or os.getenv("SLACK_USER_DM", "")
+                    if _dm_uid:
+                        try:
+                            from modules.slack_ops import send_dm as _sdm
+                            _pl_lbl = "Release" if pipeline == "release" else "Hotfix"
+                            _sdm(_dm_uid,
+                                f"⚠️ *Pipeline {_pl_lbl} parou — sua ação é necessária*\n"
+                                f"Etapa: *{fail_num}* falhou\n"
+                                f"Erro: {err_detail}\n"
+                                f"Acesse o dashboard para pular a etapa ou abortar.")
+                        except Exception:
+                            pass
                 except (ValueError, IndexError):
                     pass
 
@@ -283,6 +296,19 @@ def _stream_process(cmd: list[str], cwd: Path, pipeline: str, resume_from_step: 
             if clean.startswith("CONFLICT_PAUSE|"):
                 branches = [b for b in clean.split("|")[1:] if b]
                 _broadcast({"t": "conflict_pause", "branches": branches, "step": current_step})
+                _dm_uid = _load_config().get("slack_user_id") or os.getenv("SLACK_USER_DM", "")
+                if _dm_uid:
+                    try:
+                        from modules.slack_ops import send_dm as _sdm
+                        _pl_lbl = "Release" if pipeline == "release" else "Hotfix"
+                        _br_list = ", ".join(branches) if branches else "—"
+                        _sdm(_dm_uid,
+                            f"🔀 *Conflito de merge detectado — {_pl_lbl}*\n"
+                            f"Etapa: *{current_step}*\n"
+                            f"Branches: {_br_list}\n"
+                            f"Acesse o dashboard para resolver o conflito e continuar.")
+                    except Exception:
+                        pass
 
             # Detect step header: "▶  Etapa NN  Step name"
             m = _re.search(r'▶\s+Etapa\s+(\d+)\s+(.+)', clean)
@@ -349,24 +375,33 @@ def _stream_process(cmd: list[str], cwd: Path, pipeline: str, resume_from_step: 
         except Exception:
             pass
 
-        # Optional Slack notification on pipeline end (set SLACK_PIPELINE_CHANNEL in .env)
+        # Build end-of-pipeline message for Slack notifications
+        _pl_lbl   = "Release" if pipeline == "release" else "Hotfix"
+        _emoji    = "✅" if _outcome == "success" else "❌"
+        _dur_m    = _duration // 60
+        _dur_s    = _duration % 60
+        _dur_str  = f"{_dur_m}m {_dur_s}s" if _dur_m else f"{_dur_s}s"
+        _end_msg  = (
+            f"{_emoji} *Pipeline {_pl_lbl} {'concluída com sucesso' if _outcome=='success' else 'falhou'}*\n"
+            f"Versão: `{_hist_entry['version'] or '—'}`\n"
+            f"Duração: {_dur_str} · Etapas: {_steps_ok}✓ {_steps_fail}✗ {_steps_skip}⊘"
+        )
+
+        # Channel notification (optional — set SLACK_PIPELINE_CHANNEL in .env)
         _notif_channel = os.getenv("SLACK_PIPELINE_CHANNEL", "")
         if _notif_channel:
             try:
-                import datetime as _dt2
                 from modules.slack_ops import post_plain_message as _slk_post
-                _emoji  = "✅" if _outcome == "success" else "❌"
-                _pl_lbl = "Release" if pipeline == "release" else "Hotfix"
-                _dur_m  = _duration // 60
-                _dur_s  = _duration % 60
-                _dur_str = f"{_dur_m}m {_dur_s}s" if _dur_m else f"{_dur_s}s"
-                _msg = (
-                    f"{_emoji} *{_pl_lbl} pipeline {_outcome}*\n"
-                    f"Versão: `{_hist_entry['version'] or '—'}`\n"
-                    f"Duração: {_dur_str} · "
-                    f"Etapas: {_steps_ok}✓ {_steps_fail}✗ {_steps_skip}⊘"
-                )
-                _slk_post(_msg, channel=_notif_channel)
+                _slk_post(_end_msg, channel=_notif_channel)
+            except Exception:
+                pass
+
+        # DM notification (optional — configure slack_user_id in settings or SLACK_USER_DM in .env)
+        _dm_uid = _load_config().get("slack_user_id") or os.getenv("SLACK_USER_DM", "")
+        if _dm_uid:
+            try:
+                from modules.slack_ops import send_dm as _sdm
+                _sdm(_dm_uid, _end_msg)
             except Exception:
                 pass
 
@@ -703,6 +738,22 @@ def api_hotfix_report():
 def api_history():
     return jsonify(_load_history())
 
+@app.route("/api/notify/dm", methods=["POST"])
+def api_notify_dm():
+    data = request.json or {}
+    text    = data.get("text", "").strip()
+    user_id = data.get("user_id") or _load_config().get("slack_user_id") or os.getenv("SLACK_USER_DM", "")
+    if not user_id:
+        return jsonify({"ok": False, "error": "slack_user_id não configurado"}), 400
+    if not text:
+        return jsonify({"ok": False, "error": "text vazio"}), 400
+    try:
+        from modules.slack_ops import send_dm
+        ts = send_dm(user_id, text)
+        return jsonify({"ok": True, "ts": ts})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.route("/api/git/branches")
 def api_git_branches():
     ticket = request.args.get("ticket", "").strip().upper()
@@ -927,8 +978,24 @@ def api_formalizacoes_enviar(item_id):
         item["status"] = "error"
         item["error"] = str(e)
         _save_formalizacoes(items)
+        # DM on formalization error
+        _dm_uid = _load_config().get("slack_user_id") or os.getenv("SLACK_USER_DM", "")
+        if _dm_uid:
+            try:
+                from modules.slack_ops import send_dm
+                send_dm(_dm_uid, f"❌ *Erro ao formalizar*\nTicket: {item['task']}\nBranch: `{item['branch']}`\nErro: {str(e)}")
+            except Exception:
+                pass
         return jsonify({"ok": False, "error": str(e)}), 500
     _save_formalizacoes(items)
+    # DM on successful formalization
+    _dm_uid = _load_config().get("slack_user_id") or os.getenv("SLACK_USER_DM", "")
+    if _dm_uid:
+        try:
+            from modules.slack_ops import send_dm
+            send_dm(_dm_uid, f"✅ *Formalização enviada*\nTicket: {item['task']}\nBranch: `{item['branch']}`")
+        except Exception:
+            pass
     return jsonify({"ok": True, "item": item})
 
 
@@ -2202,6 +2269,8 @@ details.fz-preview[open] summary::before{content:'▾ ';}
           <span class="status-dot" id="run-dot"></span>
           <span id="run-label">Ocioso</span>
         </div>
+        <span id="run-timer" style="font-size:12px;color:var(--text3);font-variant-numeric:tabular-nums;display:none;margin-left:4px;">⏱ 0:00</span>
+        <span id="run-estimate" style="font-size:11px;color:var(--text3);display:none;margin-left:2px;"></span>
       </div>
 
       <div class="pipeline-grid">
@@ -2292,6 +2361,8 @@ details.fz-preview[open] summary::before{content:'▾ ';}
           <span class="status-dot" id="hotfix-run-dot"></span>
           <span id="hotfix-run-label">Ocioso</span>
         </div>
+        <span id="hotfix-run-timer" style="font-size:12px;color:var(--text3);font-variant-numeric:tabular-nums;display:none;margin-left:4px;">⏱ 0:00</span>
+        <span id="hotfix-run-estimate" style="font-size:11px;color:var(--text3);display:none;margin-left:2px;"></span>
       </div>
 
       <div class="pipeline-grid">
@@ -2707,9 +2778,19 @@ details.fz-preview[open] summary::before{content:'▾ ';}
         <input class="form-control" id="m-registry" placeholder="zanthusinovacao1/zcrm_front">
       </div>
     </div>
-    <div class="form-row">
-      <label class="form-label">Nome do time</label>
-      <input class="form-control" id="m-team" placeholder="Front-end ZCRM">
+    <div class="form-row-2">
+      <div class="form-row">
+        <label class="form-label">Nome do time</label>
+        <input class="form-control" id="m-team" placeholder="Front-end ZCRM">
+      </div>
+      <div class="form-row">
+        <label class="form-label">Slack User ID (DM)</label>
+        <input class="form-control" id="m-slack-uid" placeholder="U01ABC123"
+          title="ID do membro no Slack — clique no seu nome → ⋯ → Copiar ID do membro">
+      </div>
+    </div>
+    <div style="font-size:11px;color:var(--text3);margin:-8px 0 12px;">
+      💬 Com o Slack User ID configurado, o bot vai te mandar DM quando a pipeline falhar, ter conflito, terminar — e ao formalizar.
     </div>
     <div class="modal-footer">
       <button class="btn btn-ghost" onclick="closeCfgModal()">Cancelar</button>
@@ -3160,6 +3241,12 @@ function renderHistory() {
     ['dora-df-badge','dora-lt-badge','dora-cfr-badge','dora-mttr-badge'].forEach(id => { const el=document.getElementById(id); if(el){ el.textContent=''; el.className='dora-badge'; } });
     return;
   }
+
+  // Compute avg durations for estimate display
+  const last5Rel = _history.filter(e => e.pipeline === 'release' && e.outcome === 'success').slice(0, 5);
+  const last5Hf  = _history.filter(e => e.pipeline === 'hotfix'  && e.outcome === 'success').slice(0, 5);
+  _avgDurations.release = last5Rel.length ? Math.round(last5Rel.reduce((s,e) => s+(e.duration_s||0), 0) / last5Rel.length / 60) : null;
+  _avgDurations.hotfix  = last5Hf.length  ? Math.round(last5Hf.reduce((s,e)  => s+(e.duration_s||0), 0) / last5Hf.length  / 60) : null;
 
   // Deployment Frequency: successful deploys per week over last 30d
   const succRecent = recent.filter(e => e.outcome === 'success').length;
@@ -4105,6 +4192,66 @@ function setRunningUI(running, paused = false) {
   ind.classList.toggle('visible', running);
 }
 
+// ── live timer ────────────────────────────────────────────────────────────────
+let _timerInterval = null;
+let _timerStart    = null;
+
+function _fmtTimer(ms) {
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const h = Math.floor(m / 60);
+  const ss = String(s % 60).padStart(2, '0');
+  const mm = String(m % 60).padStart(2, '0');
+  return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
+}
+
+function _startTimer(isHotfix) {
+  _timerStart = Date.now();
+  const timerId = isHotfix ? 'hotfix-run-timer' : 'run-timer';
+  const estId   = isHotfix ? 'hotfix-run-estimate' : 'run-estimate';
+  const timerEl = document.getElementById(timerId);
+  const estEl   = document.getElementById(estId);
+  if (timerEl) timerEl.style.display = '';
+  if (estEl) {
+    const avgMin = _avgDurations[isHotfix ? 'hotfix' : 'release'];
+    if (avgMin) {
+      estEl.textContent = `/ estimado ~${avgMin}min`;
+      estEl.style.display = '';
+    }
+  }
+  if (_timerInterval) clearInterval(_timerInterval);
+  _timerInterval = setInterval(() => {
+    if (timerEl) timerEl.textContent = '⏱ ' + _fmtTimer(Date.now() - _timerStart);
+  }, 1000);
+}
+
+function _stopTimer(isHotfix) {
+  if (_timerInterval) { clearInterval(_timerInterval); _timerInterval = null; }
+  const timerId = isHotfix ? 'hotfix-run-timer' : 'run-timer';
+  const estId   = isHotfix ? 'hotfix-run-estimate' : 'run-estimate';
+  const el = document.getElementById(timerId);
+  const estEl = document.getElementById(estId);
+  if (el) el.style.display = 'none';
+  if (estEl) estEl.style.display = 'none';
+}
+
+// avg durations per pipeline type (minutes), populated by renderHistory
+let _avgDurations = { release: null, hotfix: null };
+
+// ── browser notifications ─────────────────────────────────────────────────────
+function _requestNotifPerm() {
+  if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+}
+
+function _notif(title, body, icon) {
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  try {
+    new Notification(title, { body: body || '', icon: icon || '' });
+  } catch(e) {}
+}
+
 function connectStream() {
   if (es) { es.close(); es = null; }
   es = new EventSource('/api/release/stream');
@@ -4116,6 +4263,8 @@ function connectStream() {
 
     if (msg.t === 'start') {
       const fromStep = msg.from_step || 0;
+      _requestNotifPerm();
+      _startTimer(isHotfix);
       if (isHotfix) {
         resetHotfixStepCards();
         setHotfixRunningUI(true);
@@ -4156,6 +4305,8 @@ function connectStream() {
 
     } else if (msg.t === 'step_fail_pause') {
       showStepFailModal(msg.step, msg.error || '', isHotfix);
+      _notif('⚠️ Pipeline parou — ação necessária',
+        `Etapa ${msg.step} falhou: ${(msg.error||'').slice(0, 120)}`);
 
     } else if (msg.t === 'paused') {
       if (isHotfix) setHotfixRunningUI(true, true);
@@ -4170,6 +4321,8 @@ function connectStream() {
       showConflictModal(msg.branches || [], conflictStep);
       if (isHotfix) _updateHotfixStepCard(conflictStep, 'paused');
       else          _updateStepCard(conflictStep, 'paused');
+      _notif('🔀 Conflito de merge detectado',
+        `Etapa ${conflictStep} — ${(msg.branches||[]).join(', ')}`);
 
     } else if (msg.t === 'line') {
       if (isHotfix) {
@@ -4189,8 +4342,13 @@ function connectStream() {
       dot.className = 'status-dot ' + (ok ? 'done-ok' : 'done-err');
       document.getElementById(lblId).textContent =
         ok ? 'Concluído ✓' : 'Falhou ✕ (código ' + msg.code + ')';
+      const plName = isHotfix ? 'Hotfix' : 'Release';
+      _notif(ok ? `✅ Pipeline ${plName} concluída` : `❌ Pipeline ${plName} falhou`,
+        ok ? 'Todas as etapas finalizadas com sucesso.' : 'Verifique o dashboard para detalhes.');
 
     } else if (msg.t === 'end') {
+      _stopTimer(isHotfix);
+      loadHistory();   // auto-refresh history & overview widget
       if (isHotfix) {
         setHotfixRunningUI(false);
         renderHotfixStepCards();
@@ -4978,6 +5136,7 @@ function openCfgModal() {
   document.getElementById('m-next-crm').value     = cfg.next_crm        || '';
   document.getElementById('m-registry').value     = cfg.docker_registry || '';
   document.getElementById('m-team').value         = cfg.team_name       || '';
+  document.getElementById('m-slack-uid').value    = cfg.slack_user_id   || '';
   document.getElementById('cfg-modal').classList.add('open');
 }
 function closeCfgModal() { document.getElementById('cfg-modal').classList.remove('open'); }
@@ -4993,6 +5152,7 @@ async function saveCfgModal() {
     next_crm:        document.getElementById('m-next-crm').value.trim(),
     docker_registry: document.getElementById('m-registry').value.trim(),
     team_name:       document.getElementById('m-team').value.trim(),
+    slack_user_id:   document.getElementById('m-slack-uid').value.trim(),
   };
   await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});
   renderAll();

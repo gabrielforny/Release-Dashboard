@@ -475,6 +475,29 @@ def post_plain_message(
         raise SlackError(f"Erro ao postar mensagem: {e.response['error']}")
 
 
+def send_dm(user_id: str, text: str) -> str:
+    """
+    Envia mensagem direta (DM) para um usuário do Slack.
+    user_id: ID do membro no Slack (ex: U01ABC123) — não é o @nome.
+    Retorna o ts da mensagem enviada.
+    """
+    from slack_sdk import WebClient
+    from slack_sdk.errors import SlackApiError
+
+    token = os.getenv("SLACK_TOKEN")
+    if not token:
+        raise SlackError("SLACK_TOKEN não definido no ambiente")
+
+    client = WebClient(token=token)
+    try:
+        dm = client.conversations_open(users=[user_id])
+        channel_id = dm["channel"]["id"]
+        resp = client.chat_postMessage(channel=channel_id, text=text)
+        return resp["ts"]
+    except SlackApiError as e:
+        raise SlackError(f"Erro ao enviar DM: {e.response['error']}")
+
+
 def reply_release_spec(
     thread_ts: str,
     crm_release: str,
