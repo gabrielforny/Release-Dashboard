@@ -234,6 +234,7 @@ def _stream_process(cmd: list[str], cwd: Path, pipeline: str, resume_from_step: 
         _ansi = _re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-9;]*[mGKHJF]|\[\?[0-9;]*[lh])')
         current_step          = 0
         current_step_failed   = False  # True when STEP_FAIL|N was received
+        current_step_skipped  = False  # True when STEP_SKIPPED|N was received
         error_buf             = []
 
         import time as _time
@@ -288,6 +289,7 @@ def _stream_process(cmd: list[str], cwd: Path, pipeline: str, resume_from_step: 
                 try:
                     skip_num = int(clean.split("|")[1])
                     _steps_skip += 1
+                    current_step_skipped = True
                     _broadcast({"t": "step_done", "step": skip_num, "status": "skipped"})
                 except (ValueError, IndexError):
                     pass
@@ -314,14 +316,15 @@ def _stream_process(cmd: list[str], cwd: Path, pipeline: str, resume_from_step: 
             m = _re.search(r'▶\s+Etapa\s+(\d+)\s+(.+)', clean)
             if m:
                 # Only send step_done for the previous step if it wasn't
-                # already sent via STEP_FAIL (to avoid double-marking).
-                if current_step > 0 and not current_step_failed:
+                # already sent via STEP_FAIL or STEP_SKIPPED (avoid double-marking).
+                if current_step > 0 and not current_step_failed and not current_step_skipped:
                     _steps_ok += 1
                     _broadcast({"t": "step_done", "step": current_step, "status": "success"})
-                current_step        = int(m.group(1))
-                current_step_failed = False
-                _current_step       = current_step
-                error_buf           = []
+                current_step         = int(m.group(1))
+                current_step_failed  = False
+                current_step_skipped = False
+                _current_step        = current_step
+                error_buf            = []
                 _broadcast({"t": "step_start", "step": current_step, "name": m.group(2).strip()})
 
             # Collect error context for descriptive failure messages
@@ -673,6 +676,20 @@ def api_hotfix_run():
 
         threading.Thread(target=_stream_process, args=(cmd, BASE_DIR, "hotfix", from_step), daemon=True).start()
         return jsonify({"ok": True})
+
+@app.route("/api/hotfix/skip-step", methods=["POST"])
+def api_hotfix_skip_step():
+    """Write the skip-signal file for step 6 (ng build --prod)."""
+    data = request.json or {}
+    step = int(data.get("step", 6))
+    if step == 6:
+        try:
+            Path("/tmp/hotfix_skip_step6").touch()
+            return jsonify({"ok": True})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": False, "error": "Apenas a etapa 6 suporta pulo em tempo real"}), 400
+
 
 @app.route("/api/hotfix/retry-step", methods=["POST"])
 def api_hotfix_retry_step():
@@ -1631,6 +1648,8 @@ a{color:var(--accent);}
   display:none;white-space:pre-wrap;word-break:break-word;
 }
 .sc-error.open{display:block;}
+.sc-skip-btn{background:rgba(37,99,235,.1);color:var(--info);border:none;border-radius:6px;padding:3px 10px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap;}
+.sc-skip-btn:hover{background:rgba(37,99,235,.18);}
 .sc-retry-btn{
   margin-top:6px;display:inline-block;font-size:11px;color:var(--warn);background:none;
   border:1px solid rgba(217,119,6,.4);border-radius:4px;padding:3px 10px;cursor:pointer;
@@ -2059,6 +2078,33 @@ details.fz-preview[open] summary::before{content:'▾ ';}
 .dora-badge.high{background:rgba(37,99,235,.12);color:var(--info);}
 .dora-badge.medium{background:rgba(217,119,6,.12);color:var(--warn);}
 .dora-badge.low{background:rgba(220,38,38,.12);color:var(--danger);}
+/* ── Hotfix Guide Panel ─────────────────────────────────────────────────── */
+.hotfix-guide-panel{display:flex;flex-direction:column;gap:18px;padding:20px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);}
+.hg-header{display:flex;align-items:center;gap:10px;padding-bottom:14px;border-bottom:1px solid var(--border);}
+.hg-header-icon{font-size:22px;line-height:1;}
+.hg-header-title{font-size:16px;font-weight:700;color:var(--text);}
+.hg-header-sub{font-size:12px;color:var(--text3);margin-left:auto;}
+.hg-two-col{display:grid;grid-template-columns:1fr 1fr;gap:18px;}
+@media(max-width:900px){.hg-two-col{grid-template-columns:1fr;}}
+.hg-section-title{font-size:11px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--text3);margin-bottom:10px;}
+.hg-desc{font-size:13px;color:var(--text2);line-height:1.6;}
+.hg-table{width:100%;border-collapse:collapse;font-size:12px;}
+.hg-table tr{border-bottom:1px solid var(--border);}
+.hg-table tr:last-child{border-bottom:none;}
+.hg-table td{padding:6px 4px;vertical-align:top;color:var(--text2);}
+.hg-field{font-weight:600;color:var(--text);white-space:nowrap;padding-right:10px;min-width:120px;}
+.hg-example{font-family:monospace;font-size:11px;color:var(--accent);background:rgba(var(--accent-rgb,.5 .5 .5),.08);padding:1px 5px;border-radius:4px;}
+.hg-tips{display:flex;flex-direction:column;gap:10px;}
+.hg-tip{display:flex;gap:10px;align-items:flex-start;}
+.hg-tip-icon{font-size:16px;line-height:1.4;flex-shrink:0;}
+.hg-tip-body{font-size:12px;color:var(--text2);line-height:1.5;}
+.hg-tip-body strong{color:var(--text);}
+.hg-steps-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px;}
+.hg-step-item{display:flex;align-items:flex-start;gap:8px;padding:8px 10px;background:var(--bg);border:1px solid var(--border);border-radius:8px;}
+.hg-step-num{font-size:11px;font-weight:700;color:var(--text3);min-width:18px;padding-top:1px;font-variant-numeric:tabular-nums;}
+.hg-step-icon{font-size:14px;line-height:1.2;flex-shrink:0;}
+.hg-step-body{font-size:12px;color:var(--text2);line-height:1.4;}
+.hg-step-body strong{color:var(--text);display:block;margin-bottom:1px;}
 </style>
 </head>
 <body>
@@ -2347,8 +2393,10 @@ details.fz-preview[open] summary::before{content:'▾ ';}
             <option value="6">06 — ng build --prod</option>
             <option value="7">07 — Criar tag do hotfix</option>
             <option value="8">08 — Propagar para release atual</option>
-            <option value="9">09 — Docker build + push</option>
-            <option value="10">10 — Relatório final</option>
+            <option value="9">09 — Docker build</option>
+            <option value="10">10 — Docker tag + push</option>
+            <option value="11">11 — Notificação Slack</option>
+            <option value="12">12 — Relatório final</option>
           </select>
         </div>
       </div>
@@ -3099,10 +3147,12 @@ const DEFAULT_HOTFIX_STEPS = [
   {id:4,  name:'Atualizar CHANGELOG',             dur:'—', status:'pending'},
   {id:5,  name:'Atualizar package.json + commit', dur:'—', status:'pending'},
   {id:6,  name:'ng build --prod',                 dur:'—', status:'pending'},
-  {id:7,  name:'Criar tag do hotfix',              dur:'—', status:'pending'},
+  {id:7,  name:'Criar tag do hotfix',             dur:'—', status:'pending'},
   {id:8,  name:'Propagar para a release atual',   dur:'—', status:'pending'},
-  {id:9,  name:'Docker build + push',             dur:'—', status:'pending'},
-  {id:10, name:'Relatório final',                 dur:'—', status:'pending'},
+  {id:9,  name:'Docker build',                    dur:'—', status:'pending'},
+  {id:10, name:'Docker tag + push',               dur:'—', status:'pending'},
+  {id:11, name:'Notificação Slack',               dur:'—', status:'pending'},
+  {id:12, name:'Relatório final',                 dur:'—', status:'pending'},
 ];
 
 let hotfixStepsState   = JSON.parse(JSON.stringify(DEFAULT_HOTFIX_STEPS));
@@ -3170,6 +3220,7 @@ async function init() {
 
   renderAll();
   renderHotfixChecklist();
+  renderHotfixStepCards();   // show guide on idle state
 
   const r = await fetch('/api/release/status');
   const s = await r.json();
@@ -3893,9 +3944,99 @@ function resetStepCards() {
 }
 
 // ── hotfix step cards (mesmo padrão dos cards de release, estado isolado) ─────
+function _hotfixGuideHTML() {
+  return `<div class="hotfix-guide-panel">
+  <div class="hg-header">
+    <span class="hg-header-icon">📖</span>
+    <span class="hg-header-title">Guia de uso — Pipeline de Hotfix</span>
+    <span class="hg-header-sub">Preencha o formulário ao lado e clique em ▶ Iniciar Hotfix</span>
+  </div>
+
+  <div class="hg-two-col">
+    <div>
+      <div class="hg-section-title">Campos do formulário</div>
+      <table class="hg-table">
+        <tr>
+          <td class="hg-field">Branch de hotfix</td>
+          <td>Branch que contém a correção<br><span class="hg-example">hotfix/NEOSDEV-1234-corrige-login</span></td>
+        </tr>
+        <tr>
+          <td class="hg-field">Release alvo</td>
+          <td>Release em produção que receberá o fix</td>
+        </tr>
+        <tr>
+          <td class="hg-field">Versão do hotfix</td>
+          <td>Versão gerada para o fix<br><span class="hg-example">v2.30.4_zcrm_api_2.30.0</span></td>
+        </tr>
+        <tr>
+          <td class="hg-field">Chave do JIRA</td>
+          <td>Detectada automaticamente da branch</td>
+        </tr>
+        <tr>
+          <td class="hg-field">Descrição</td>
+          <td>Pré-preenchida da branch — usada no CHANGELOG</td>
+        </tr>
+        <tr>
+          <td class="hg-field">Release anterior</td>
+          <td>Marque se o fix é para uma release que <strong>já passou</strong> pelo teste e precisa ser propagado para a atual</td>
+        </tr>
+      </table>
+    </div>
+    <div>
+      <div class="hg-section-title">Dicas importantes</div>
+      <div class="hg-tips">
+        <div class="hg-tip">
+          <span class="hg-tip-icon">🔁</span>
+          <div class="hg-tip-body"><strong>Retomar após falha</strong><br>Use "Iniciar a partir da etapa" para pular etapas já concluídas sem refazer o trabalho</div>
+        </div>
+        <div class="hg-tip">
+          <span class="hg-tip-icon">⏭</span>
+          <div class="hg-tip-body"><strong>Pular ng build (etapa 6)</strong><br>Se o build já existir, clique em "Pular etapa" no card da etapa 6 enquanto ela está rodando</div>
+        </div>
+        <div class="hg-tip">
+          <span class="hg-tip-icon">🔀</span>
+          <div class="hg-tip-body"><strong>Conflito de merge</strong><br>O pipeline pausa automaticamente — resolva os conflitos no repositório e clique "Continuar"</div>
+        </div>
+        <div class="hg-tip">
+          <span class="hg-tip-icon">📋</span>
+          <div class="hg-tip-body"><strong>Log de cada etapa</strong><br>Clique no card da etapa para expandir o log detalhado com o output do terminal</div>
+        </div>
+        <div class="hg-tip">
+          <span class="hg-tip-icon">🔔</span>
+          <div class="hg-tip-body"><strong>Notificações automáticas</strong><br>Permita notificações no browser para alertas em tempo real. Configure Slack DM em ⚙ Configurações</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <div class="hg-section-title">As 10 etapas automatizadas</div>
+    <div class="hg-steps-grid">
+      <div class="hg-step-item"><span class="hg-step-num">01</span><span class="hg-step-icon">🔧</span><div class="hg-step-body"><strong>Preparação</strong>fetch, checkout e config do ambiente git</div></div>
+      <div class="hg-step-item"><span class="hg-step-num">02</span><span class="hg-step-icon">🔄</span><div class="hg-step-body"><strong>Checkout da release alvo</strong>posiciona no branch da release em produção</div></div>
+      <div class="hg-step-item"><span class="hg-step-num">03</span><span class="hg-step-icon">🔀</span><div class="hg-step-body"><strong>Merge do hotfix</strong>aplica o fix mantendo o package.json da release</div></div>
+      <div class="hg-step-item"><span class="hg-step-num">04</span><span class="hg-step-icon">📝</span><div class="hg-step-body"><strong>Atualizar CHANGELOG</strong>insere entrada da nova versão do hotfix</div></div>
+      <div class="hg-step-item"><span class="hg-step-num">05</span><span class="hg-step-icon">📦</span><div class="hg-step-body"><strong>Atualizar package.json</strong>sobe a versão para o identificador do hotfix</div></div>
+      <div class="hg-step-item"><span class="hg-step-num">06</span><span class="hg-step-icon">⚙️</span><div class="hg-step-body"><strong>ng build --prod</strong>compila o Angular em modo produção <em style="color:var(--text3)">(pode pular)</em></div></div>
+      <div class="hg-step-item"><span class="hg-step-num">07</span><span class="hg-step-icon">🏷️</span><div class="hg-step-body"><strong>Criar tag do hotfix</strong>cria e faz push da tag git no repositório</div></div>
+      <div class="hg-step-item"><span class="hg-step-num">08</span><span class="hg-step-icon">🔁</span><div class="hg-step-body"><strong>Propagar para release atual</strong>merge do hotfix na release em teste (se aplicável)</div></div>
+      <div class="hg-step-item"><span class="hg-step-num">09</span><span class="hg-step-icon">🐳</span><div class="hg-step-body"><strong>Docker build</strong>executa <code>make docker-file</code> para construir a imagem</div></div>
+      <div class="hg-step-item"><span class="hg-step-num">10</span><span class="hg-step-icon">📤</span><div class="hg-step-body"><strong>Docker tag + push</strong>aplica tag e envia a imagem para o registry</div></div>
+      <div class="hg-step-item"><span class="hg-step-num">11</span><span class="hg-step-icon">💬</span><div class="hg-step-body"><strong>Notificação Slack</strong>posta aviso no #team-frontend com a versão e instruções</div></div>
+      <div class="hg-step-item"><span class="hg-step-num">12</span><span class="hg-step-icon">📊</span><div class="hg-step-body"><strong>Relatório final</strong>gera resumo da operação com links e resultados</div></div>
+    </div>
+  </div>
+</div>`;
+}
+
 function renderHotfixStepCards() {
   const container = document.getElementById('steps-hotfix');
   if (!container) return;
+  // Show guide when no pipeline is running (all steps pending)
+  if (hotfixStepsState.every(s => s.status === 'pending')) {
+    container.innerHTML = _hotfixGuideHTML();
+    return;
+  }
   container.innerHTML = hotfixStepsState.map(s => {
     const iconInfo = {
       success:{cls:'si-success',ch:'✓',spin:false},
@@ -3910,11 +4051,15 @@ function renderHotfixStepCards() {
     const spinCls = iconInfo.spin ? ' sc-spinning' : '';
     const hasLog  = (hotfixStepLogs[s.id]||[]).length > 0;
 
+    const skipBtn = (s.id === 6 && s.status === 'running')
+      ? `<button class="sc-skip-btn" onclick="event.stopPropagation();skipHotfixBuild()">⏭ Pular etapa</button>`
+      : '';
     return `<div class="step-card ${cardCls}" id="hsc-${s.id}">
       <div class="sc-header" onclick="toggleHotfixStepLog(${s.id})">
         <span class="sc-icon ${iconInfo.cls}${spinCls}">${iconInfo.ch}</span>
         <span class="sc-name">${s.name}</span>
         <span class="sc-dur">${s.dur}</span>
+        ${skipBtn}
         <button class="sc-log-btn" onclick="event.stopPropagation();toggleHotfixStepLog(${s.id})"
           style="${s.status==='pending'&&!hasLog?'visibility:hidden':''}">Log</button>
       </div>
@@ -3981,6 +4126,25 @@ async function retryHotfixStep(stepId) {
   }
 }
 
+async function skipHotfixBuild() {
+  const ok = await showConfirm(
+    'Pular o ng build --prod?\n\nO build em execução será encerrado e o pipeline continuará para a próxima etapa.\n\nUse isso se os artefatos de build já existem de uma execução anterior.',
+    {icon:'⏭', title:'Pular ng build', okLabel:'Pular etapa'}
+  );
+  if (!ok) return;
+  try {
+    const r = await fetch('/api/hotfix/skip-step', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({step: 6}),
+    });
+    const j = await r.json();
+    if (!j.ok) showAlert('Erro ao pular: ' + (j.error || 'Falhou'), {icon:'❌', title:'Erro'});
+  } catch(e) {
+    showAlert('Erro de rede: ' + e.message, {icon:'❌', title:'Erro de rede'});
+  }
+}
+
 function _updateHotfixStepCard(stepId, status, dur, error) {
   const s = hotfixStepsState.find(s=>s.id===stepId);
   if (!s) return;
@@ -4021,6 +4185,22 @@ function _updateHotfixStepCard(stepId, status, dur, error) {
     errEl.classList.add('open');
   } else if (errEl) {
     errEl.classList.remove('open');
+  }
+
+  // Show/hide skip button for step 6 (ng build) when running
+  if (stepId === 6) {
+    let skipBtn = card.querySelector('.sc-skip-btn');
+    if (status === 'running') {
+      if (!skipBtn) {
+        skipBtn = document.createElement('button');
+        skipBtn.className = 'sc-skip-btn';
+        skipBtn.textContent = '⏭ Pular etapa';
+        skipBtn.onclick = e => { e.stopPropagation(); skipHotfixBuild(); };
+        card.querySelector('.sc-dur').after(skipBtn);
+      }
+    } else if (skipBtn) {
+      skipBtn.remove();
+    }
   }
 
   if (status === 'running') {

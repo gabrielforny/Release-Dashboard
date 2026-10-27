@@ -8,16 +8,19 @@ de release):
   4. Atualizar CHANGELOG com o conteúdo do hotfix (chave JIRA + descrição)
   5. Atualizar package.json com a versão do hotfix + commit único + push
      ("changelog vX + versão atualizada no package.json")
-  6. ng build --prod
+  6. ng build --prod  (suporta skip via /tmp/hotfix_skip_step6)
   7. Criar e enviar a tag do hotfix
   8. Se o hotfix for de uma release ANTERIOR à que está em teste: propagar o
      fix para a branch da release atual, resolvendo o conflito de
      package.json mantendo a versão da release atual (--ours)
-  9. Build e push da imagem Docker do hotfix
-  10. Relatório final
+  9. Docker build (make docker-file)
+  10. Docker tag + push
+  11. Notificação Slack #team-frontend
+  12. Relatório final
 """
 
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -27,6 +30,21 @@ from rich.console import Console
 from modules import build_ops, changelog, docker_ops, git_ops
 from modules.context import HotfixContext, StepResult, StepStatus
 from modules import ui
+
+
+def _next_hotfix_version(version: str) -> tuple[str, str]:
+    """
+    Given 'v2.54.2_zcrm_api_2.54.0', returns:
+    - family:       'v2.54'
+    - next_version: 'v2.54.3_zcrm_api_2.54.0'
+    """
+    m = re.match(r'^(v\d+\.\d+)\.(\d+)(.*)', version)
+    if not m:
+        return version, version
+    prefix   = m.group(1)     # 'v2.54'
+    hotfix_n = int(m.group(2))
+    suffix   = m.group(3)     # '_zcrm_api_2.54.0'
+    return prefix, f"{prefix}.{hotfix_n + 1}{suffix}"
 
 
 def _read_crm_version(pkg_path: Path) -> str:
@@ -280,11 +298,17 @@ class HotfixSteps:
         ui.step_header(6, "ng build --prod")
         with self._step("ng build --prod") as step:
             ui.info("Executando ng build --prod (pode demorar) …")
+            ui.info("Use o botão 'Pular etapa' no dashboard para ignorar o build.")
             try:
                 log_path = build_ops.ng_build_prod(self.repo, timeout=900)
                 self.ctx.build_log_path = log_path
                 ui.success(f"Build concluído — log salvo em {log_path}")
                 step.ok()
+                return True
+            except build_ops.BuildSkipped:
+                ui.info("Build pulado pelo usuário — continuando pipeline.")
+                print("STEP_SKIPPED|6", flush=True)
+                step.skip()
                 return True
             except build_ops.BuildError as e:
                 ui.error(str(e))
@@ -357,25 +381,17 @@ class HotfixSteps:
                 return False
 
     # ------------------------------------------------------------------
-    # Etapa 9 — Build e push da imagem Docker do hotfix
+    # Etapa 9 — Docker build (make docker-file)
     # ------------------------------------------------------------------
 
-    def step_09_docker_build_push(self) -> bool:
-        ui.step_header(9, "Build e push da imagem Docker do hotfix")
-        with self._step("Docker build + push") as step:
+    def step_09_docker_build(self) -> bool:
+        ui.step_header(9, "Docker build (make docker-file)")
+        with self._step("Docker build") as step:
             try:
                 git_ops.checkout(self.ctx.target_release_branch, cwd=self.repo)
                 ui.info("Executando make docker-file …")
                 docker_ops.make_docker_file(cwd=self.repo, timeout=600)
-                ui.success("Imagem Docker construída")
-
-                tag = self.ctx.docker_tag
-                docker_ops.tag_image("zcrm_front:latest", tag)
-                ui.success(f"Tag criada: {tag}")
-
-                ui.info("Push em andamento …")
-                docker_ops.push_image(tag, timeout=300)
-                ui.success(f"Push concluído: {tag}")
+                ui.success("Imagem Docker construída (zcrm_front:latest)")
                 step.ok()
                 return True
             except (docker_ops.DockerError, git_ops.GitError) as e:
@@ -384,11 +400,71 @@ class HotfixSteps:
                 return False
 
     # ------------------------------------------------------------------
-    # Etapa 10 — Relatório final
+    # Etapa 10 — Docker tag + push
     # ------------------------------------------------------------------
 
-    def step_10_final_report(self) -> bool:
-        ui.step_header(10, "Relatório final")
+    def step_10_docker_tag_push(self) -> bool:
+        ui.step_header(10, "Docker tag + push")
+        with self._step("Docker tag + push") as step:
+            try:
+                tag = self.ctx.docker_tag
+                docker_ops.tag_image("zcrm_front:latest", tag)
+                ui.success(f"Tag Docker criada: {tag}")
+
+                ui.info("Push em andamento …")
+                docker_ops.push_image(tag, timeout=300)
+                ui.success(f"Push concluído: {tag}")
+                step.ok()
+                return True
+            except docker_ops.DockerError as e:
+                ui.error(str(e))
+                step.fail(str(e))
+                return False
+
+    # ------------------------------------------------------------------
+    # Etapa 11 — Notificação Slack #team-frontend
+    # ------------------------------------------------------------------
+
+    def step_11_notify_slack(self) -> bool:
+        ui.step_header(11, "Notificação Slack #team-frontend")
+        with self._step("Notificação Slack") as step:
+            try:
+                from modules.slack_ops import post_plain_message, SlackError
+
+                version = self.ctx.hotfix_version
+                family, next_v = _next_hotfix_version(version)
+
+                lines = [
+                    f":warning:  Liberado novo hotfix {version}",
+                    "",
+                    f"Se houver algum novo hotfix a ser feito para {family}, ele deve partir da "
+                    f"tag {version} (via `git checkout tags/{version}`) para criar a {next_v}",
+                ]
+
+                if self.ctx.is_previous_release and self.ctx.current_release_branch:
+                    lines += [
+                        "",
+                        f":warning: A {self.ctx.current_release_branch} acabou de ser atualizada "
+                        f"com este hotfix, façam pull da mesma e atualizem suas branches de "
+                        f"desenvolvimento/hotfix da sprint com ela.",
+                    ]
+
+                msg = "\n".join(lines)
+                ts = post_plain_message(msg)
+                ui.success(f"Mensagem postada em #team-frontend (ts={ts})")
+                step.ok()
+                return True
+            except Exception as e:
+                ui.error(f"Falha ao notificar Slack: {e}")
+                step.fail(str(e))
+                return False
+
+    # ------------------------------------------------------------------
+    # Etapa 12 — Relatório final
+    # ------------------------------------------------------------------
+
+    def step_12_final_report(self) -> bool:
+        ui.step_header(12, "Relatório final")
         with self._step("Relatório final") as step:
             from modules import report as report_mod
 
@@ -451,9 +527,11 @@ class HotfixSteps:
             self.step_06_build,
             self.step_07_create_tag,
             self.step_08_forward_merge,
-            self.step_09_docker_build_push,
+            self.step_09_docker_build,
+            self.step_10_docker_tag_push,
+            self.step_11_notify_slack,
         ]
-        report_step = self.step_10_final_report
+        report_step = self.step_12_final_report
         pipeline.append(report_step)
 
         for step_fn in pipeline:
