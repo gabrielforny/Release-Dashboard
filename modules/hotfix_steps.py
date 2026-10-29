@@ -390,7 +390,7 @@ class HotfixSteps:
             try:
                 git_ops.checkout(self.ctx.target_release_branch, cwd=self.repo)
                 ui.info("Executando make docker-file …")
-                docker_ops.make_docker_file(cwd=self.repo, timeout=600)
+                docker_ops.make_docker_file(cwd=self.repo, timeout=1800)
                 ui.success("Imagem Docker construída (zcrm_front:latest)")
                 step.ok()
                 return True
@@ -551,7 +551,7 @@ class HotfixSteps:
                 if step_num:
                     print(f"STEP_FAIL|{step_num}", flush=True)
                 if step_fn is not report_step:
-                    self.step_10_final_report()
+                    self.step_12_final_report()
                 break
 
             if not ok:
@@ -559,7 +559,7 @@ class HotfixSteps:
                     print(f"STEP_FAIL|{step_num}", flush=True)
                 ui.error("Etapa falhou — interrompendo pipeline de hotfix. Veja o relatório para detalhes.")
                 if step_fn is not report_step:
-                    self.step_10_final_report()
+                    self.step_12_final_report()
                 break
 
             if step_num and step_fn is not report_step:
