@@ -412,7 +412,7 @@ class HotfixSteps:
                 ui.success(f"Tag Docker criada: {tag}")
 
                 ui.info("Push em andamento …")
-                docker_ops.push_image(tag, timeout=300)
+                docker_ops.push_image(tag, timeout=600)
                 ui.success(f"Push concluído: {tag}")
                 step.ok()
                 return True

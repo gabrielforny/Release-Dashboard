@@ -563,7 +563,7 @@ class ReleaseSteps:
                 ui.success(f"Tag criada: {tag}")
 
                 ui.info("Push em andamento …")
-                docker_ops.push_image(tag, timeout=300)
+                docker_ops.push_image(tag, timeout=600)
                 ui.success(f"Push concluído: {tag}")
                 step.ok()
                 return True
@@ -669,7 +669,7 @@ class ReleaseSteps:
                 docker_ops.tag_image("zcrm_front:latest", tag_rc)
                 ui.success(f"Tag RC criada: {tag_rc}")
 
-                docker_ops.push_image(tag_rc, timeout=300)
+                docker_ops.push_image(tag_rc, timeout=600)
                 ui.success(f"Push RC concluído: {tag_rc}")
                 step.ok()
                 return True
