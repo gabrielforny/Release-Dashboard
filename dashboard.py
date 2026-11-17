@@ -3228,10 +3228,19 @@ async function init() {
     activePipeline = s.pipeline || 'release';
     if (activePipeline === 'hotfix') {
       setHotfixRunningUI(true, s.paused || false);
-      if (s.step) { _hotfixCurrentStep = s.step; _updateHotfixStepCard(s.step, s.paused ? 'paused' : 'running'); }
+      if (s.step) {
+        for (let i = 1; i < s.step; i++) _updateHotfixStepCard(i, 'success', '—');
+        _hotfixCurrentStep = s.step;
+        _updateHotfixStepCard(s.step, s.paused ? 'paused' : 'running');
+      }
     } else {
       setRunningUI(true, s.paused || false);
-      if (s.step) { _currentStep = s.step; _updateStepCard(s.step, s.paused ? 'paused' : 'running'); }
+      if (s.step) {
+        // Mark already-completed steps as success so the user sees progress
+        for (let i = 1; i < s.step; i++) _updateStepCard(i, 'success', '—');
+        _currentStep = s.step;
+        _updateStepCard(s.step, s.paused ? 'paused' : 'running');
+      }
     }
     connectStream();
   }
@@ -4343,6 +4352,9 @@ async function startHotfix() {
     });
     const j = await r.json();
     if (!j.ok) { await showAlert('Erro ao iniciar: ' + (j.error||'Falhou'), {icon:'❌', title:'Erro'}); return; }
+    if (fromStep > 1) {
+      for (let i = 1; i < fromStep; i++) _updateHotfixStepCard(i, 'success', '—');
+    }
     setHotfixRunningUI(true);
     connectStream();
   } catch(e) {
@@ -4815,6 +4827,12 @@ async function confirmWizard() {
     const j = await r.json();
     if (!j.ok) { await showAlert(j.error || 'Falhou', {icon:'❌', title:'Erro ao iniciar'}); return; }
     activePipeline = 'release';
+    // Reset cards immediately (don't rely on the SSE 'start' event which
+    // is broadcast before the client SSE connection is established)
+    resetStepCards();
+    if (fromStep > 1) {
+      for (let i = 1; i < fromStep; i++) _updateStepCard(i, 'success', '—');
+    }
     setRunningUI(true);
     closeWizard();
     connectStream();
